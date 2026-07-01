@@ -10,8 +10,7 @@ No ffmpeg, no system audio libraries required — everything is compiled in.
 | Platform | Install |
 |---|---|
 | macOS | `brew install rust` |
-| Ubuntu/Debian | `sudo apt install cargo build-essential` |
-| Fedora | `sudo dnf install cargo gcc gcc-c++` |
+| Ubuntu/Debian | `sudo apt install -y cargo build-essential libssl-dev libopus-dev pkg-config autoconf automake libtool libopus-dev` |
 | Windows | [rustup.rs](https://rustup.rs) + [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022) |
 
 ## Build
