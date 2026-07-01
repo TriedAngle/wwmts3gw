@@ -4,10 +4,9 @@ mod timer;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use futures::{future, prelude::*};
-use std::{
-    path::PathBuf,
-};
+use std::path::PathBuf;
 use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 use tsclientlib::{events::Event, ChannelId, Connection, DisconnectOptions, Identity, StreamItem};
 use tsproto_packets::packets::OutPacket;
 
@@ -98,6 +97,8 @@ impl PlaybackTarget {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_target(false).init();
+
     let args = Args::parse();
 
     if args.channel.is_some() && args.channel_id.is_some() {
@@ -149,7 +150,7 @@ async fn main() -> Result<()> {
         opts = opts.identity(identity);
     }
 
-    println!("Connecting to {} as {} ...", args.server, args.name);
+    info!("Connecting to {} as {} ...", args.server, args.name);
     let mut con = opts
         .connect()
         .context("failed to start TeamSpeak connection")?;
@@ -166,15 +167,15 @@ async fn main() -> Result<()> {
         bail!("connection closed before initial TeamSpeak state arrived");
     }
 
-    println!("Connected. can_send_audio = {}", con.can_send_audio());
+    info!("Connected. can_send_audio = {}", con.can_send_audio());
     if target.is_whisper() {
-        println!("Whisper mode: {}", target.describe());
+        info!("Whisper mode: {}", target.describe());
     } else {
-        println!("Normal mode: playing into the bot's current channel");
+        info!("Normal mode: playing into the bot's current channel");
     }
 
-    println!("Jungle timer is stopped. Send '!jungle start' in TeamSpeak chat to begin.");
-    println!("Commands: '!jungle start [MM:SS]', '!jungle countdown <seconds>', '!jungle stop'.");
+    info!("Jungle timer is stopped. Send '!jungle start' in TeamSpeak chat to begin.");
+    info!("Commands: '!jungle start [MM:SS] [at MM:SS]', '!jungle set MM:SS', '!jungle stop'.");
 
     let (packet_tx, mut packet_rx) = mpsc::channel::<OutPacket>(64);
     let (timer_tx, timer_rx) = mpsc::channel::<TimerCommand>(32);
@@ -185,7 +186,7 @@ async fn main() -> Result<()> {
         if let Err(err) =
             timer::jungle_timer(producer_args, producer_target, packet_tx, timer_rx).await
         {
-            eprintln!("Jungle timer stopped: {err:?}");
+            error!("Jungle timer stopped: {err:?}");
         }
     });
 
@@ -211,7 +212,7 @@ async fn main() -> Result<()> {
                 bail!("TeamSpeak connection closed");
             }
             _ = tokio::signal::ctrl_c() => {
-                println!("Disconnecting ...");
+                info!("Disconnecting ...");
                 con.disconnect(DisconnectOptions::new())?;
                 break;
             }
@@ -240,13 +241,13 @@ async fn handle_stream_item(event: StreamItem, command_tx: &mpsc::Sender<TimerCo
 
         match parsed {
             Ok(command) => {
-                println!("Jungle command from {}: {}", invoker.name, message);
+                info!(client = %invoker.id, command = %message, "command received");
                 if command_tx.send(command).await.is_err() {
-                    eprintln!("Could not handle jungle command because the timer task stopped");
+                    error!("could not handle command: timer task stopped");
                 }
             }
             Err(err) => {
-                eprintln!("Invalid jungle command from {}: {err}", invoker.name);
+                warn!(client = %invoker.id, error = %err, "invalid command");
             }
         }
     }

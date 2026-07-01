@@ -1,16 +1,15 @@
-use crate::{Args, PlaybackTarget};
+use std::{path::Path, time::Duration};
+
 use anyhow::Result;
-use std::{
-    path::Path,
-    time::Duration,
-};
 use tokio::{
     sync::mpsc,
     time::{self, Instant},
 };
+use tracing::{info, warn};
 use tsproto_packets::packets::OutPacket;
 
 use crate::audio;
+use crate::{Args, PlaybackTarget, WhisperScope};
 
 const GAME_LENGTH: Duration = Duration::from_secs(30 * 60);
 const JUNGLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -19,7 +18,7 @@ const ANNOUNCE_OFFSETS: &[(u64, &str)] = &[(60, "60s"), (30, "30s"), (15, "15s")
 #[derive(Debug, Clone, Copy)]
 pub enum TimerState {
     Stopped,
-    Countdown { starts_at: Instant },
+    Countdown { starts_at: Instant, elapsed: Duration },
     Running { game_zero: Instant },
 }
 
@@ -29,6 +28,8 @@ pub enum TimerCommand {
     Stop,
     Status,
     Help,
+    Channel,
+    Group,
 }
 
 fn next_announcement(game_zero: Instant) -> Option<(Instant, &'static str)> {
@@ -49,10 +50,12 @@ fn next_announcement(game_zero: Instant) -> Option<(Instant, &'static str)> {
 
 pub async fn jungle_timer(
     args: Args,
-    target: PlaybackTarget,
+    mut target: PlaybackTarget,
     tx: mpsc::Sender<OutPacket>,
     mut commands: mpsc::Receiver<TimerCommand>,
 ) -> Result<()> {
+    let group_id = args.whisper_server_group_id;
+    let scope = args.whisper_scope;
     let mut state = TimerState::Stopped;
 
     loop {
@@ -61,24 +64,35 @@ pub async fn jungle_timer(
                 let Some(command) = commands.recv().await else {
                     return Ok(());
                 };
-                apply_timer_command(command, &TimerState::Stopped)
+                let (new_state, tc) =
+                    handle_command(command, &TimerState::Stopped, group_id, scope);
+                if let Some(t) = tc {
+                    target = t;
+                }
+                new_state
             }
-            TimerState::Countdown { starts_at } => {
+            TimerState::Countdown {
+                starts_at,
+                elapsed,
+            } => {
                 tokio::select! {
                     command = commands.recv() => {
                         let Some(command) = command else { return Ok(()); };
-                        let current = TimerState::Countdown { starts_at };
-                        apply_timer_command(command, &current)
+                        let current = TimerState::Countdown { starts_at, elapsed };
+                        let (new_state, tc) = handle_command(command, &current, group_id, scope);
+                        if let Some(t) = tc { target = t; }
+                        new_state
                     }
                     _ = time::sleep_until(starts_at) => {
-                        println!("Jungle timer started.");
-                        TimerState::Running { game_zero: starts_at }
+                        let game_zero = starts_at.checked_sub(elapsed).unwrap_or(starts_at);
+                        info!("Jungle timer started.");
+                        TimerState::Running { game_zero }
                     }
                 }
             }
             TimerState::Running { game_zero } => match next_announcement(game_zero) {
                 None => {
-                    println!("Jungle timer finished all announcements.");
+                    info!("Jungle timer finished all announcements.");
                     TimerState::Stopped
                 }
                 Some((play_at, label)) => {
@@ -90,14 +104,17 @@ pub async fn jungle_timer(
                     tokio::select! {
                         command = commands.recv() => {
                             let Some(command) = command else { return Ok(()); };
-                            apply_timer_command(command, &TimerState::Running { game_zero })
+                            let current = TimerState::Running { game_zero };
+                            let (new_state, tc) = handle_command(command, &current, group_id, scope);
+                            if let Some(t) = tc { target = t; }
+                            new_state
                         }
                         _ = time::sleep_until(play_at) => {
-                            println!(
-                                "Playing jungle {} announcement at {}: {}",
+                            info!(
                                 label,
-                                format_remaining(Instant::now().duration_since(game_zero)),
-                                file.display()
+                                remaining = format_remaining(Instant::now().duration_since(game_zero)),
+                                file = %file.display(),
+                                "playing announcement",
                             );
                             audio::play_audio_once(file, args.volume, &target, &tx).await?;
                             TimerState::Running { game_zero }
@@ -109,13 +126,44 @@ pub async fn jungle_timer(
     }
 }
 
+fn handle_command(
+    command: TimerCommand,
+    state: &TimerState,
+    group_id: Option<u64>,
+    scope: WhisperScope,
+) -> (TimerState, Option<PlaybackTarget>) {
+    match command {
+        TimerCommand::Channel => {
+            info!("switched to channel playback");
+            (*state, Some(PlaybackTarget::CurrentChannel))
+        }
+        TimerCommand::Group => match group_id {
+            Some(id) => {
+                info!(group = id, "switched to server group whisper");
+                (
+                    *state,
+                    Some(PlaybackTarget::ServerGroup {
+                        group_id: id,
+                        scope,
+                    }),
+                )
+            }
+            None => {
+                warn!("no server group configured (use --whisper-server-group-id at startup)");
+                (*state, None)
+            }
+        },
+        other => (apply_timer_command(other, state), None),
+    }
+}
+
 fn apply_timer_command(command: TimerCommand, state: &TimerState) -> TimerState {
     match command {
         TimerCommand::Start { elapsed, delay } => start_timer(elapsed, delay),
         TimerCommand::Stop => {
             match state {
-                TimerState::Stopped => println!("Jungle timer is already stopped."),
-                _ => println!("Jungle timer stopped."),
+                TimerState::Stopped => info!("Jungle timer is already stopped."),
+                _ => info!("Jungle timer stopped."),
             }
             TimerState::Stopped
         }
@@ -127,12 +175,13 @@ fn apply_timer_command(command: TimerCommand, state: &TimerState) -> TimerState 
             print_timer_help();
             *state
         }
+        TimerCommand::Channel | TimerCommand::Group => unreachable!(),
     }
 }
 
 fn start_timer(elapsed: Duration, delay: Duration) -> TimerState {
     if elapsed > GAME_LENGTH {
-        println!("Cannot start jungle timer: game is already over.");
+        warn!("cannot start: game is already over");
         return TimerState::Stopped;
     }
 
@@ -140,27 +189,32 @@ fn start_timer(elapsed: Duration, delay: Duration) -> TimerState {
 
     if delay > Duration::ZERO {
         let starts_at = now + delay;
-        println!(
-            "Jungle timer countdown started: game timer begins in {}.",
-            format_duration(delay)
+        info!(
+            remaining = format_remaining(elapsed),
+            delay = format_duration(delay),
+            "countdown started, game begins in {}",
+            format_duration(delay),
         );
-        return TimerState::Countdown { starts_at };
+        return TimerState::Countdown {
+            starts_at,
+            elapsed,
+        };
     }
 
     let game_zero = now.checked_sub(elapsed).unwrap_or(now);
     match next_announcement(game_zero) {
         None => {
-            println!(
-                "No remaining jungle announcements at game time {}.",
-                format_remaining(elapsed)
+            info!(
+                remaining = format_remaining(elapsed),
+                "no remaining announcements",
             );
             TimerState::Stopped
         }
         Some((_, label)) => {
-            println!(
-                "Jungle timer started at game time {}; next {} announcement.",
-                format_remaining(elapsed),
-                label
+            info!(
+                remaining = format_remaining(elapsed),
+                next = label,
+                "timer started",
             );
             TimerState::Running { game_zero }
         }
@@ -169,10 +223,10 @@ fn start_timer(elapsed: Duration, delay: Duration) -> TimerState {
 
 fn print_timer_status(state: &TimerState) {
     match state {
-        TimerState::Stopped => println!("Jungle timer is stopped."),
-        TimerState::Countdown { starts_at } => {
-            println!(
-                "Jungle timer countdown: game timer starts in {}.",
+        TimerState::Stopped => info!("Jungle timer is stopped."),
+        TimerState::Countdown { starts_at, .. } => {
+            info!(
+                "jungle timer countdown: game timer starts in {}",
                 format_duration(starts_at.duration_since(Instant::now()))
             );
         }
@@ -180,28 +234,30 @@ fn print_timer_status(state: &TimerState) {
             let elapsed = Instant::now().duration_since(*game_zero);
             match next_announcement(*game_zero) {
                 Some((_, label)) => {
-                    println!(
-                        "Jungle timer running at {}; next {} announcement.",
-                        format_remaining(elapsed),
-                        label
+                    info!(
+                        remaining = format_remaining(elapsed),
+                        next = label,
+                        "timer running",
                     );
                 }
-                None => println!("Jungle timer has no remaining announcements."),
+                None => info!("Jungle timer has no remaining announcements."),
             }
         }
     }
 }
 
 fn print_timer_help() {
-    println!("Jungle commands:");
-    println!("  !jungle start                     start at 30:00 now");
-    println!("  !jungle start 3:00                start at 30:00 in 3 minutes");
-    println!("  !jungle start at 25:00            start immediately at 25:00");
-    println!("  !jungle start 3:00 at 25:00       start at 25:00 in 3 minutes");
-    println!("  !jungle set 25:00                 set game time to 25:00");
-    println!("  !jungle stop                      stop the timer");
-    println!("  !jungle status                    print current timer state");
-    println!("  !jungle help                      show this message");
+    info!("Jungle commands:");
+    info!("  !jungle start                     start at 30:00 now");
+    info!("  !jungle start 3:00                start at 30:00 in 3 minutes");
+    info!("  !jungle start at 25:00            start immediately at 25:00");
+    info!("  !jungle start 3:00 at 25:00       start at 25:00 in 3 minutes");
+    info!("  !jungle set 25:00                 set game time to 25:00");
+    info!("  !jungle channel                   play to current channel");
+    info!("  !jungle group                     whisper to configured server group");
+    info!("  !jungle stop                      stop the timer");
+    info!("  !jungle status                    print current timer state");
+    info!("  !jungle help                      show this message");
 }
 
 pub fn parse_timer_command(message: &str) -> Option<std::result::Result<TimerCommand, String>> {
@@ -222,6 +278,8 @@ pub fn parse_timer_command(message: &str) -> Option<std::result::Result<TimerCom
         "stop" => Ok(TimerCommand::Stop),
         "status" => Ok(TimerCommand::Status),
         "help" => Ok(TimerCommand::Help),
+        "channel" => Ok(TimerCommand::Channel),
+        "group" => Ok(TimerCommand::Group),
         _ => Err(format!("unknown command '{action}'. Try '!jungle help'.")),
     };
 
@@ -242,9 +300,8 @@ fn parse_start(args: &[&str]) -> std::result::Result<TimerCommand, String> {
         let countdown_str = joined[..at_idx].trim();
         let gametime_str = joined[at_idx + 4..].trim();
 
-        let gametime = parse_mmss(gametime_str).ok_or_else(|| {
-            "expected game time after 'at', e.g. '3:00 at 25:00'".to_string()
-        })?;
+        let gametime = parse_mmss(gametime_str)
+            .ok_or_else(|| "expected game time after 'at', e.g. '3:00 at 25:00'".to_string())?;
         let elapsed = GAME_LENGTH
             .checked_sub(gametime)
             .ok_or_else(|| "game time cannot exceed 30:00".to_string())?;
@@ -259,9 +316,8 @@ fn parse_start(args: &[&str]) -> std::result::Result<TimerCommand, String> {
 
         Ok(TimerCommand::Start { elapsed, delay })
     } else {
-        let delay = parse_mmss(&joined).ok_or_else(|| {
-            "expected time as MM:SS, e.g. '!jungle start 3:00'".to_string()
-        })?;
+        let delay = parse_mmss(&joined)
+            .ok_or_else(|| "expected time as MM:SS, e.g. '!jungle start 3:00'".to_string())?;
         Ok(TimerCommand::Start {
             elapsed: Duration::ZERO,
             delay,
@@ -271,9 +327,8 @@ fn parse_start(args: &[&str]) -> std::result::Result<TimerCommand, String> {
 
 fn parse_set(args: &[&str]) -> std::result::Result<TimerCommand, String> {
     let joined = args.join(" ");
-    let gametime = parse_mmss(joined.trim()).ok_or_else(|| {
-        "expected game time as MM:SS, e.g. '!jungle set 25:00'".to_string()
-    })?;
+    let gametime = parse_mmss(joined.trim())
+        .ok_or_else(|| "expected game time as MM:SS, e.g. '!jungle set 25:00'".to_string())?;
     let elapsed = GAME_LENGTH
         .checked_sub(gametime)
         .ok_or_else(|| "game time cannot exceed 30:00".to_string())?;

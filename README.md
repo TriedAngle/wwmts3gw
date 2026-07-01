@@ -75,6 +75,8 @@ Send as a channel, server, private, or poke message to the bot. All times are `M
 | `!jungle start at 25:00` | Start immediately at **25:00** (late join) |
 | `!jungle start 3:00 at 25:00` | 3-minute countdown, then start at **25:00** |
 | `!jungle set 25:00` | Set running timer to **25:00** |
+| `!jungle channel` | Switch to channel playback |
+| `!jungle group` | Switch to server group whisper |
 | `!jungle stop` | Stop the timer |
 | `!jungle status` | Show current game time and next announcement |
 | `!jungle help` | Show all commands |
