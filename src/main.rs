@@ -7,7 +7,9 @@ use futures::{future, prelude::*};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-use tsclientlib::{events::Event, ChannelId, Connection, DisconnectOptions, Identity, StreamItem};
+use ts_bookkeeping::messages::c2s::OutSendTextMessagePart;
+use ts_bookkeeping::{ClientId, TextMessageTargetMode};
+use tsclientlib::{OutCommandExt, ChannelId, Connection, DisconnectOptions, Identity, StreamItem, events::Event};
 use tsproto_packets::packets::OutPacket;
 
 use timer::TimerCommand;
@@ -95,9 +97,20 @@ impl PlaybackTarget {
     }
 }
 
+pub struct Inbound {
+    pub command: TimerCommand,
+    pub from_client: ClientId,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_target(false).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "wwmts3gw=info".into()),
+        )
+        .with_target(false)
+        .init();
 
     let args = Args::parse();
 
@@ -178,13 +191,15 @@ async fn main() -> Result<()> {
     info!("Commands: '!jungle start [MM:SS] [at MM:SS]', '!jungle set MM:SS', '!jungle stop'.");
 
     let (packet_tx, mut packet_rx) = mpsc::channel::<OutPacket>(64);
-    let (timer_tx, timer_rx) = mpsc::channel::<TimerCommand>(32);
+    let (timer_tx, timer_rx) = mpsc::channel::<Inbound>(32);
+    let (response_tx, mut response_rx) = mpsc::channel::<(ClientId, String)>(32);
     let producer_args = args.clone();
     let producer_target = target.clone();
 
     tokio::spawn(async move {
         if let Err(err) =
-            timer::jungle_timer(producer_args, producer_target, packet_tx, timer_rx).await
+            timer::jungle_timer(producer_args, producer_target, packet_tx, timer_rx, response_tx)
+                .await
         {
             error!("Jungle timer stopped: {err:?}");
         }
@@ -211,6 +226,16 @@ async fn main() -> Result<()> {
                 result.context("TeamSpeak event stream ended with an error")?;
                 bail!("TeamSpeak connection closed");
             }
+            maybe_response = response_rx.recv() => {
+                if let Some((client_id, text)) = maybe_response {
+                    let msg = OutSendTextMessagePart {
+                        target: TextMessageTargetMode::Client,
+                        target_client_id: Some(client_id),
+                        message: text.into(),
+                    };
+                    msg.send(&mut con)?;
+                }
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("Disconnecting ...");
                 con.disconnect(DisconnectOptions::new())?;
@@ -222,7 +247,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_stream_item(event: StreamItem, command_tx: &mpsc::Sender<TimerCommand>) {
+async fn handle_stream_item(event: StreamItem, command_tx: &mpsc::Sender<Inbound>) {
     let StreamItem::BookEvents(events) = event else {
         return;
     };
@@ -242,7 +267,11 @@ async fn handle_stream_item(event: StreamItem, command_tx: &mpsc::Sender<TimerCo
         match parsed {
             Ok(command) => {
                 info!(client = %invoker.id, command = %message, "command received");
-                if command_tx.send(command).await.is_err() {
+                let inbound = Inbound {
+                    command,
+                    from_client: invoker.id,
+                };
+                if command_tx.send(inbound).await.is_err() {
                     error!("could not handle command: timer task stopped");
                 }
             }

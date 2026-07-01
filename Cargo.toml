@@ -12,5 +12,6 @@ symphonia = { version = "0.5", default-features = false, features = ["wav", "pcm
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ts-bookkeeping = "0.1"
 tsclientlib = "0.2.0"
 tsproto-packets = "0.1"

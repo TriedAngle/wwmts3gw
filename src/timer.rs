@@ -9,7 +9,8 @@ use tracing::{info, warn};
 use tsproto_packets::packets::OutPacket;
 
 use crate::audio;
-use crate::{Args, PlaybackTarget, WhisperScope};
+use crate::{Inbound, Args, PlaybackTarget, WhisperScope};
+use ts_bookkeeping::ClientId;
 
 const GAME_LENGTH: Duration = Duration::from_secs(30 * 60);
 const JUNGLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -52,7 +53,8 @@ pub async fn jungle_timer(
     args: Args,
     mut target: PlaybackTarget,
     tx: mpsc::Sender<OutPacket>,
-    mut commands: mpsc::Receiver<TimerCommand>,
+    mut commands: mpsc::Receiver<Inbound>,
+    response_tx: mpsc::Sender<(ClientId, String)>,
 ) -> Result<()> {
     let group_id = args.whisper_server_group_id;
     let scope = args.whisper_scope;
@@ -61,11 +63,17 @@ pub async fn jungle_timer(
     loop {
         state = match state {
             TimerState::Stopped => {
-                let Some(command) = commands.recv().await else {
+                let Some(inbound) = commands.recv().await else {
                     return Ok(());
                 };
-                let (new_state, tc) =
-                    handle_command(command, &TimerState::Stopped, group_id, scope);
+                let (new_state, tc) = handle_command(
+                    inbound.command,
+                    &TimerState::Stopped,
+                    group_id,
+                    scope,
+                    &response_tx,
+                    inbound.from_client,
+                );
                 if let Some(t) = tc {
                     target = t;
                 }
@@ -77,9 +85,12 @@ pub async fn jungle_timer(
             } => {
                 tokio::select! {
                     command = commands.recv() => {
-                        let Some(command) = command else { return Ok(()); };
+                        let Some(inbound) = command else { return Ok(()); };
                         let current = TimerState::Countdown { starts_at, elapsed };
-                        let (new_state, tc) = handle_command(command, &current, group_id, scope);
+                        let (new_state, tc) = handle_command(
+                            inbound.command, &current, group_id, scope,
+                            &response_tx, inbound.from_client,
+                        );
                         if let Some(t) = tc { target = t; }
                         new_state
                     }
@@ -103,9 +114,12 @@ pub async fn jungle_timer(
                     };
                     tokio::select! {
                         command = commands.recv() => {
-                            let Some(command) = command else { return Ok(()); };
+                            let Some(inbound) = command else { return Ok(()); };
                             let current = TimerState::Running { game_zero };
-                            let (new_state, tc) = handle_command(command, &current, group_id, scope);
+                            let (new_state, tc) = handle_command(
+                                inbound.command, &current, group_id, scope,
+                                &response_tx, inbound.from_client,
+                            );
                             if let Some(t) = tc { target = t; }
                             new_state
                         }
@@ -126,20 +140,36 @@ pub async fn jungle_timer(
     }
 }
 
+fn respond(
+    tx: &mpsc::Sender<(ClientId, String)>,
+    client: ClientId,
+    text: impl Into<String>,
+) {
+    let _ = tx.try_send((client, text.into()));
+}
+
 fn handle_command(
     command: TimerCommand,
     state: &TimerState,
     group_id: Option<u64>,
     scope: WhisperScope,
+    response_tx: &mpsc::Sender<(ClientId, String)>,
+    from_client: ClientId,
 ) -> (TimerState, Option<PlaybackTarget>) {
     match command {
         TimerCommand::Channel => {
             info!("switched to channel playback");
+            respond(response_tx, from_client, "switched to channel playback");
             (*state, Some(PlaybackTarget::CurrentChannel))
         }
         TimerCommand::Group => match group_id {
             Some(id) => {
                 info!(group = id, "switched to server group whisper");
+                respond(
+                    response_tx,
+                    from_client,
+                    format!("switched to server group whisper (group {id})"),
+                );
                 (
                     *state,
                     Some(PlaybackTarget::ServerGroup {
@@ -149,39 +179,63 @@ fn handle_command(
                 )
             }
             None => {
-                warn!("no server group configured (use --whisper-server-group-id at startup)");
+                warn!("no server group configured");
+                respond(
+                    response_tx,
+                    from_client,
+                    "no server group configured (use --whisper-server-group-id at startup)",
+                );
                 (*state, None)
             }
         },
-        other => (apply_timer_command(other, state), None),
+        other => (apply_timer_command(other, state, response_tx, from_client), None),
     }
 }
 
-fn apply_timer_command(command: TimerCommand, state: &TimerState) -> TimerState {
+fn apply_timer_command(
+    command: TimerCommand,
+    state: &TimerState,
+    response_tx: &mpsc::Sender<(ClientId, String)>,
+    from_client: ClientId,
+) -> TimerState {
     match command {
-        TimerCommand::Start { elapsed, delay } => start_timer(elapsed, delay),
+        TimerCommand::Start { elapsed, delay } => {
+            start_timer(elapsed, delay, response_tx, from_client)
+        }
         TimerCommand::Stop => {
             match state {
-                TimerState::Stopped => info!("Jungle timer is already stopped."),
-                _ => info!("Jungle timer stopped."),
+                TimerState::Stopped => {
+                    info!("Jungle timer is already stopped.");
+                    respond(response_tx, from_client, "timer is already stopped");
+                }
+                _ => {
+                    info!("Jungle timer stopped.");
+                    respond(response_tx, from_client, "timer stopped");
+                }
             }
             TimerState::Stopped
         }
         TimerCommand::Status => {
-            print_timer_status(state);
+            print_timer_status(state, response_tx, from_client);
             *state
         }
         TimerCommand::Help => {
-            print_timer_help();
+            print_timer_help(response_tx, from_client);
             *state
         }
         TimerCommand::Channel | TimerCommand::Group => unreachable!(),
     }
 }
 
-fn start_timer(elapsed: Duration, delay: Duration) -> TimerState {
+fn start_timer(
+    elapsed: Duration,
+    delay: Duration,
+    response_tx: &mpsc::Sender<(ClientId, String)>,
+    from_client: ClientId,
+) -> TimerState {
     if elapsed > GAME_LENGTH {
         warn!("cannot start: game is already over");
+        respond(response_tx, from_client, "cannot start: game is already over");
         return TimerState::Stopped;
     }
 
@@ -189,12 +243,13 @@ fn start_timer(elapsed: Duration, delay: Duration) -> TimerState {
 
     if delay > Duration::ZERO {
         let starts_at = now + delay;
-        info!(
-            remaining = format_remaining(elapsed),
-            delay = format_duration(delay),
-            "countdown started, game begins in {}",
+        let msg = format!(
+            "countdown started: game begins in {} at {}",
             format_duration(delay),
+            format_remaining(elapsed),
         );
+        info!("{}", msg);
+        respond(response_tx, from_client, msg);
         return TimerState::Countdown {
             starts_at,
             elapsed,
@@ -204,60 +259,79 @@ fn start_timer(elapsed: Duration, delay: Duration) -> TimerState {
     let game_zero = now.checked_sub(elapsed).unwrap_or(now);
     match next_announcement(game_zero) {
         None => {
-            info!(
-                remaining = format_remaining(elapsed),
-                "no remaining announcements",
+            let msg = format!(
+                "started at {}: no remaining announcements",
+                format_remaining(elapsed),
             );
+            info!("{}", msg);
+            respond(response_tx, from_client, msg);
             TimerState::Stopped
         }
         Some((_, label)) => {
-            info!(
-                remaining = format_remaining(elapsed),
-                next = label,
-                "timer started",
+            let msg = format!(
+                "started at {}; next {} announcement",
+                format_remaining(elapsed),
+                label,
             );
+            info!("{}", msg);
+            respond(response_tx, from_client, msg);
             TimerState::Running { game_zero }
         }
     }
 }
 
-fn print_timer_status(state: &TimerState) {
-    match state {
-        TimerState::Stopped => info!("Jungle timer is stopped."),
+fn print_timer_status(
+    state: &TimerState,
+    response_tx: &mpsc::Sender<(ClientId, String)>,
+    from_client: ClientId,
+) {
+    let msg = match state {
+        TimerState::Stopped => "timer is stopped".to_string(),
         TimerState::Countdown { starts_at, .. } => {
-            info!(
-                "jungle timer countdown: game timer starts in {}",
+            format!(
+                "countdown: game begins in {}",
                 format_duration(starts_at.duration_since(Instant::now()))
-            );
+            )
         }
         TimerState::Running { game_zero } => {
             let elapsed = Instant::now().duration_since(*game_zero);
             match next_announcement(*game_zero) {
                 Some((_, label)) => {
-                    info!(
-                        remaining = format_remaining(elapsed),
-                        next = label,
-                        "timer running",
-                    );
+                    format!(
+                        "running at {}; next {} announcement",
+                        format_remaining(elapsed),
+                        label,
+                    )
                 }
-                None => info!("Jungle timer has no remaining announcements."),
+                None => format!(
+                    "running at {}: no remaining announcements",
+                    format_remaining(elapsed),
+                ),
             }
         }
-    }
+    };
+    info!("{}", msg);
+    respond(response_tx, from_client, msg);
 }
 
-fn print_timer_help() {
-    info!("Jungle commands:");
-    info!("  !jungle start                     start at 30:00 now");
-    info!("  !jungle start 3:00                start at 30:00 in 3 minutes");
-    info!("  !jungle start at 25:00            start immediately at 25:00");
-    info!("  !jungle start 3:00 at 25:00       start at 25:00 in 3 minutes");
-    info!("  !jungle set 25:00                 set game time to 25:00");
-    info!("  !jungle channel                   play to current channel");
-    info!("  !jungle group                     whisper to configured server group");
-    info!("  !jungle stop                      stop the timer");
-    info!("  !jungle status                    print current timer state");
-    info!("  !jungle help                      show this message");
+fn print_timer_help(
+    response_tx: &mpsc::Sender<(ClientId, String)>,
+    from_client: ClientId,
+) {
+    let msg = [
+        "!jungle start                     start at 30:00 now",
+        "!jungle start 3:00                start at 30:00 in 3 minutes",
+        "!jungle start at 25:00            start immediately at 25:00",
+        "!jungle start 3:00 at 25:00       start at 25:00 in 3 minutes",
+        "!jungle set 25:00                 set game time to 25:00",
+        "!jungle channel                   play to current channel",
+        "!jungle group                     whisper to configured server group",
+        "!jungle stop                      stop the timer",
+        "!jungle status                    print current timer state",
+        "!jungle help                      show this message",
+    ]
+    .join("\n");
+    respond(response_tx, from_client, msg);
 }
 
 pub fn parse_timer_command(message: &str) -> Option<std::result::Result<TimerCommand, String>> {
