@@ -5,14 +5,13 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use futures::{future, prelude::*};
 use std::path::PathBuf;
-use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tokio::time::{self, Instant};
+use tracing::{info, warn};
 use ts_bookkeeping::messages::c2s::OutSendTextMessagePart;
-use ts_bookkeeping::{ClientId, TextMessageTargetMode};
+use ts_bookkeeping::TextMessageTargetMode;
 use tsclientlib::{OutCommandExt, ChannelId, Connection, DisconnectOptions, Identity, StreamItem, events::Event};
-use tsproto_packets::packets::OutPacket;
 
-use timer::TimerCommand;
+use timer::{TimerCommand, TimerState};
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhisperScope {
@@ -82,24 +81,25 @@ pub enum PlaybackTarget {
     ServerGroup { group_id: u64, scope: WhisperScope },
 }
 
-impl PlaybackTarget {
-    fn is_whisper(&self) -> bool {
-        matches!(self, PlaybackTarget::ServerGroup { .. })
-    }
-
-    fn describe(&self) -> String {
-        match self {
-            PlaybackTarget::CurrentChannel => "current channel".to_string(),
-            PlaybackTarget::ServerGroup { group_id, scope } => {
-                format!("server group {group_id}, scope={scope:?}")
-            }
-        }
-    }
+/// An announcement clip mid-stream: precomputed Opus frames, sent one per tick.
+struct Playback<'a> {
+    frames: &'a [Vec<u8>],
+    idx: usize,
+    next_at: Instant,
 }
 
-pub struct Inbound {
-    pub command: TimerCommand,
-    pub from_client: ClientId,
+/// What the next deadline does when it fires.
+#[derive(Clone, Copy)]
+enum Due {
+    Frame,
+    GameStart { game_zero: Instant },
+    Announce { offset: u64, game_zero: Instant },
+}
+
+/// TeamSpeak clients render ':x' sequences as emoticons ("30:00" becomes "30😲0").
+/// A zero-width space after each colon breaks the pattern without visible change.
+fn escape_emoticons(text: &str) -> String {
+    text.replace(':', ":\u{200B}")
 }
 
 #[tokio::main]
@@ -120,26 +120,22 @@ async fn main() -> Result<()> {
     if args.volume < 0.0 {
         bail!("--volume must be >= 0.0");
     }
-    if !args.warn_60s.exists() {
-        bail!(
-            "60-second announcement audio file does not exist: {}",
-            args.warn_60s.display()
-        );
-    }
-    if !args.warn_30s.exists() {
-        bail!(
-            "30-second announcement audio file does not exist: {}",
-            args.warn_30s.display()
-        );
-    }
-    if !args.warn_15s.exists() {
-        bail!(
-            "15-second announcement audio file does not exist: {}",
-            args.warn_15s.display()
-        );
+
+    // Encode the clips up front: validates the files and makes playback a cheap send-per-tick.
+    let clip_paths = [&args.warn_60s, &args.warn_30s, &args.warn_15s];
+    let mut clips = Vec::with_capacity(clip_paths.len());
+    for (&offset, path) in timer::ANNOUNCE_OFFSETS.iter().zip(clip_paths) {
+        let frames = audio::encode_clip(path, args.volume)
+            .with_context(|| format!("failed to load {offset}s announcement {}", path.display()))?;
+        clips.push((offset, frames));
     }
 
-    let target = build_playback_target(&args);
+    let group_id = args.whisper_server_group_id;
+    let scope = args.whisper_scope;
+    let mut target = match group_id {
+        Some(group_id) => PlaybackTarget::ServerGroup { group_id, scope },
+        None => PlaybackTarget::CurrentChannel,
+    };
 
     let mut opts = Connection::build(args.server.clone()).name(args.name.clone());
 
@@ -180,60 +176,137 @@ async fn main() -> Result<()> {
         bail!("connection closed before initial TeamSpeak state arrived");
     }
 
+    // The server echoes our own text messages back as events; remember our id to skip them.
+    let own_id = con.get_state()?.own_client;
+
     info!("Connected. can_send_audio = {}", con.can_send_audio());
-    if target.is_whisper() {
-        info!("Whisper mode: {}", target.describe());
-    } else {
-        info!("Normal mode: playing into the bot's current channel");
+    match &target {
+        PlaybackTarget::ServerGroup { group_id, scope } => {
+            info!("Whisper mode: server group {group_id}, scope={scope:?}");
+        }
+        PlaybackTarget::CurrentChannel => {
+            info!("Normal mode: playing into the bot's current channel");
+        }
     }
 
     info!("Jungle timer is stopped. Send '!jungle start' in TeamSpeak chat to begin.");
     info!("Commands: '!jungle start [MM:SS] [at MM:SS]', '!jungle set MM:SS', '!jungle stop'.");
 
-    let (packet_tx, mut packet_rx) = mpsc::channel::<OutPacket>(64);
-    let (timer_tx, timer_rx) = mpsc::channel::<Inbound>(32);
-    let (response_tx, mut response_rx) = mpsc::channel::<(ClientId, String)>(32);
-    let producer_args = args.clone();
-    let producer_target = target.clone();
-
-    tokio::spawn(async move {
-        if let Err(err) =
-            timer::jungle_timer(producer_args, producer_target, packet_tx, timer_rx, response_tx)
-                .await
-        {
-            error!("Jungle timer stopped: {err:?}");
-        }
-    });
+    let mut state = TimerState::Stopped;
+    let mut playback: Option<Playback> = None;
 
     loop {
-        let command_tx = timer_tx.clone();
-        let events = con.events().try_for_each(move |event| {
-            let command_tx = command_tx.clone();
-            async move {
-                handle_stream_item(event, &command_tx).await;
-                Ok(())
+        // What fires next: the pending audio frame while a clip is streaming,
+        // otherwise the next timer transition.
+        let pending = if let Some(p) = &playback {
+            Some((p.next_at, Due::Frame))
+        } else {
+            match state {
+                TimerState::Stopped => None,
+                TimerState::Countdown { starts_at, elapsed } => Some((
+                    starts_at,
+                    Due::GameStart {
+                        game_zero: starts_at.checked_sub(elapsed).unwrap_or(starts_at),
+                    },
+                )),
+                TimerState::Running { game_zero } => match timer::next_announcement(game_zero) {
+                    Some((play_at, offset)) => Some((play_at, Due::Announce { offset, game_zero })),
+                    None => {
+                        info!("Jungle timer finished all announcements.");
+                        state = TimerState::Stopped;
+                        continue;
+                    }
+                },
             }
-        });
+        };
 
         tokio::select! {
-            maybe_packet = packet_rx.recv() => {
-                match maybe_packet {
-                    Some(packet) => con.send_audio(packet).context("failed to send TeamSpeak audio packet")?,
-                    None => bail!("audio producer exited"),
+            // into_future() consumes the stream so the future owns the &mut con borrow;
+            // map() drops the stream remainder with it, so the branch output carries no
+            // borrow and the handler body can use con again.
+            item = con.events().into_future().map(|(item, _)| item) => {
+                let item = item
+                    .transpose()
+                    .context("TeamSpeak event stream ended with an error")?;
+                let Some(item) = item else {
+                    bail!("TeamSpeak connection closed");
+                };
+                let StreamItem::BookEvents(events) = item else {
+                    continue;
+                };
+
+                for event in events {
+                    let Event::Message { invoker, message, .. } = event else {
+                        continue;
+                    };
+                    if invoker.id == own_id {
+                        continue;
+                    }
+                    let Some(parsed) = timer::parse_timer_command(&message) else {
+                        continue;
+                    };
+                    let reply = match parsed {
+                        Ok(command) => {
+                            info!(client = %invoker.id, command = %message, "command received");
+
+                            if matches!(command, TimerCommand::Stop) && playback.take().is_some() {
+                                // End the aborted audio stream cleanly.
+                                con.send_audio(audio::make_packet(&target, &[]))?;
+                            }
+
+                            let (new_state, reply) =
+                                timer::handle_command(command, &state, &mut target, group_id, scope);
+                            state = new_state;
+                            reply
+                        }
+                        Err(err) => {
+                            warn!(client = %invoker.id, error = %err, "invalid command");
+                            err
+                        }
+                    };
+
+                    OutSendTextMessagePart {
+                        target: TextMessageTargetMode::Client,
+                        target_client_id: Some(invoker.id),
+                        message: escape_emoticons(&reply).into(),
+                    }
+                    .send(&mut con)?;
                 }
             }
-            result = events => {
-                result.context("TeamSpeak event stream ended with an error")?;
-                bail!("TeamSpeak connection closed");
-            }
-            maybe_response = response_rx.recv() => {
-                if let Some((client_id, text)) = maybe_response {
-                    let msg = OutSendTextMessagePart {
-                        target: TextMessageTargetMode::Client,
-                        target_client_id: Some(client_id),
-                        message: text.into(),
-                    };
-                    msg.send(&mut con)?;
+            // The dummy deadline is never polled: the branch is disabled when pending is None.
+            _ = time::sleep_until(pending.map_or_else(Instant::now, |(at, _)| at)), if pending.is_some() => {
+                match pending.unwrap().1 {
+                    Due::Frame => {
+                        let p = playback.as_mut().expect("Due::Frame implies active playback");
+                        match p.frames.get(p.idx) {
+                            Some(frame) => {
+                                con.send_audio(audio::make_packet(&target, frame))
+                                    .context("failed to send TeamSpeak audio packet")?;
+                                p.idx += 1;
+                                p.next_at += audio::FRAME_DURATION;
+                            }
+                            None => {
+                                con.send_audio(audio::make_packet(&target, &[]))?;
+                                playback = None;
+                            }
+                        }
+                    }
+                    Due::GameStart { game_zero } => {
+                        info!("Jungle timer started.");
+                        state = TimerState::Running { game_zero };
+                    }
+                    Due::Announce { offset, game_zero } => {
+                        let (_, frames) = clips
+                            .iter()
+                            .find(|(o, _)| *o == offset)
+                            .expect("a clip is loaded for every announce offset");
+                        info!(
+                            offset,
+                            remaining = timer::format_remaining(Instant::now().duration_since(game_zero)),
+                            "playing announcement",
+                        );
+                        playback = Some(Playback { frames, idx: 0, next_at: Instant::now() });
+                    }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
@@ -245,50 +318,4 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-async fn handle_stream_item(event: StreamItem, command_tx: &mpsc::Sender<Inbound>) {
-    let StreamItem::BookEvents(events) = event else {
-        return;
-    };
-
-    for event in events {
-        let Event::Message {
-            invoker, message, ..
-        } = event
-        else {
-            continue;
-        };
-
-        let Some(parsed) = timer::parse_timer_command(&message) else {
-            continue;
-        };
-
-        match parsed {
-            Ok(command) => {
-                info!(client = %invoker.id, command = %message, "command received");
-                let inbound = Inbound {
-                    command,
-                    from_client: invoker.id,
-                };
-                if command_tx.send(inbound).await.is_err() {
-                    error!("could not handle command: timer task stopped");
-                }
-            }
-            Err(err) => {
-                warn!(client = %invoker.id, error = %err, "invalid command");
-            }
-        }
-    }
-}
-
-fn build_playback_target(args: &Args) -> PlaybackTarget {
-    if let Some(group_id) = args.whisper_server_group_id {
-        PlaybackTarget::ServerGroup {
-            group_id,
-            scope: args.whisper_scope,
-        }
-    } else {
-        PlaybackTarget::CurrentChannel
-    }
 }

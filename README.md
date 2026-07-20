@@ -30,7 +30,7 @@ Place the three announcements in the `assets/` directory (or anywhere, use the f
 | `assets/Jungle 30 sec.wav` | 30 seconds before spawn |
 | `assets/Jungle 15 sec.wav` | 15 seconds before spawn |
 
-WAV format, any sample rate (48 kHz recommended). Use the `--warn-*` flags to override paths:
+Any common audio format works (WAV, MP3, FLAC, OGG, ...) at any sample rate; clips are downmixed to mono and resampled to 48 kHz at startup. Use the `--warn-*` flags to override paths:
 
 ```bash
 --warn-60s /path/to/60s.wav
