@@ -3,27 +3,11 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use crate::{PlaybackTarget, WhisperScope};
-
 pub const GAME_LENGTH: Duration = Duration::from_secs(30 * 60);
 const JUNGLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 pub const ANNOUNCE_OFFSETS: &[u64] = &[60, 30, 15];
 /// Upper bound on user-supplied MM:SS values; keeps `Instant + delay` from overflowing.
 const MAX_MINUTES: u64 = 24 * 60;
-
-// Starts with a newline so the first line aligns with the rest in chat,
-// instead of hanging behind the "<time> \"BotName\":" prefix.
-const HELP: &str = "
-!jungle start                     start at 30:00 now
-!jungle start 3:00                start at 30:00 in 3 minutes
-!jungle start at 25:00            start immediately at 25:00
-!jungle start 3:00 at 25:00       start at 25:00 in 3 minutes
-!jungle set 25:00                 set game time to 25:00
-!jungle channel                   play to current channel
-!jungle group                     whisper to configured server group
-!jungle stop                      stop the timer
-!jungle status                    print current timer state
-!jungle help                      show this message";
 
 #[derive(Debug, Clone, Copy)]
 pub enum TimerState {
@@ -32,14 +16,23 @@ pub enum TimerState {
     Running { game_zero: Instant },
 }
 
+/// A parsed chat command: either for the timer core, or platform-specific.
+#[derive(Debug, Clone, Copy)]
+pub enum Command {
+    Timer(TimerCommand),
+    /// Handled by the chat backend: each platform replies with its own help text.
+    Help,
+    /// TS3-specific: play into the bot's current channel.
+    Channel,
+    /// TS3-specific: whisper to the configured server group.
+    Group,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum TimerCommand {
     Start { elapsed: Duration, delay: Duration },
     Stop,
     Status,
-    Help,
-    Channel,
-    Group,
 }
 
 pub fn next_announcement(game_zero: Instant) -> Option<(Instant, u64)> {
@@ -57,37 +50,9 @@ pub fn next_announcement(game_zero: Instant) -> Option<(Instant, u64)> {
     None
 }
 
-/// Applies a chat command, returning the new state and the reply for the sender.
-pub fn handle_command(
-    command: TimerCommand,
-    state: &TimerState,
-    target: &mut PlaybackTarget,
-    group_id: Option<u64>,
-    scope: WhisperScope,
-) -> (TimerState, String) {
+/// Applies a timer command, returning the new state and the reply for the sender.
+pub fn handle_command(command: TimerCommand, state: &TimerState) -> (TimerState, String) {
     match command {
-        TimerCommand::Channel => {
-            info!("switched to channel playback");
-            *target = PlaybackTarget::CurrentChannel;
-            (*state, "switched to channel playback".into())
-        }
-        TimerCommand::Group => {
-            let msg = match group_id {
-                Some(id) => {
-                    info!(group = id, "switched to server group whisper");
-                    *target = PlaybackTarget::ServerGroup {
-                        group_id: id,
-                        scope,
-                    };
-                    format!("switched to server group whisper (group {id})")
-                }
-                None => {
-                    warn!("no server group configured");
-                    "no server group configured (use --whisper-server-group-id at startup)".into()
-                }
-            };
-            (*state, msg)
-        }
         TimerCommand::Start { elapsed, delay } => start_timer(elapsed, delay),
         TimerCommand::Stop => {
             let msg = match state {
@@ -102,7 +67,6 @@ pub fn handle_command(
             info!("{}", msg);
             (*state, msg)
         }
-        TimerCommand::Help => (*state, HELP.into()),
     }
 }
 
@@ -183,7 +147,7 @@ fn status_message(state: &TimerState) -> String {
     }
 }
 
-pub fn parse_timer_command(message: &str) -> Option<Result<TimerCommand, String>> {
+pub fn parse_timer_command(message: &str) -> Option<Result<Command, String>> {
     let text = message.trim().strip_prefix('!')?;
     let mut parts = text.split_whitespace();
     let root = parts.next()?;
@@ -196,13 +160,13 @@ pub fn parse_timer_command(message: &str) -> Option<Result<TimerCommand, String>
     let rest: Vec<&str> = parts.collect();
 
     let command = match action.as_str() {
-        "start" => parse_start(&rest),
-        "set" => parse_set(&rest),
-        "stop" => Ok(TimerCommand::Stop),
-        "status" => Ok(TimerCommand::Status),
-        "help" => Ok(TimerCommand::Help),
-        "channel" => Ok(TimerCommand::Channel),
-        "group" => Ok(TimerCommand::Group),
+        "start" => parse_start(&rest).map(Command::Timer),
+        "set" => parse_set(&rest).map(Command::Timer),
+        "stop" => Ok(Command::Timer(TimerCommand::Stop)),
+        "status" => Ok(Command::Timer(TimerCommand::Status)),
+        "help" => Ok(Command::Help),
+        "channel" => Ok(Command::Channel),
+        "group" => Ok(Command::Group),
         _ => Err(format!("unknown command '{action}'. Try '!jungle help'.")),
     };
 
@@ -283,7 +247,7 @@ mod tests {
         ];
         for (msg, elapsed, delay) in cases {
             match parse_timer_command(msg).unwrap().unwrap() {
-                TimerCommand::Start { elapsed: e, delay: d } => {
+                Command::Timer(TimerCommand::Start { elapsed: e, delay: d }) => {
                     assert_eq!(e.as_secs(), elapsed, "{msg}");
                     assert_eq!(d.as_secs(), delay, "{msg}");
                 }
