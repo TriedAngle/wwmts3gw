@@ -5,6 +5,8 @@ use audiopus::coder::Encoder;
 use audiopus::{Application, Channels, SampleRate};
 use clap::ValueEnum;
 use futures::{future, prelude::*};
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 use tracing::{info, warn};
 use ts_bookkeeping::messages::c2s::OutSendTextMessagePart;
@@ -36,7 +38,7 @@ const HELP: &str = "
 !jungle status                    print current timer state
 !jungle help                      show this message";
 
-#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WhisperScope {
     AllChannels,
     CurrentChannel,
@@ -55,6 +57,40 @@ impl WhisperScope {
 enum PlaybackTarget {
     CurrentChannel,
     ServerGroup { group_id: u64, scope: WhisperScope },
+}
+
+/// A command sent by the GUI thread to the running bot.
+#[derive(Debug, Clone, Copy)]
+pub enum GuiCommand {
+    Command(Command),
+    Disconnect,
+}
+
+/// An event pushed from the bot to the GUI thread.
+#[derive(Debug, Clone)]
+pub enum BotEvent {
+    /// The connection is up and commands are accepted.
+    Connected,
+    /// The timer state changed (also sent right after connecting).
+    Timer(TimerState),
+    /// Whether audio currently goes to the server group (true) or channel.
+    Whispering(bool),
+    /// The bot loop ended; carries the error message if it failed.
+    Stopped(Option<String>),
+}
+
+pub type EventSink = Box<dyn Fn(BotEvent) + Send>;
+
+/// Channel pair connecting a GUI frontend to the bot loop.
+pub struct GuiBridge {
+    pub commands: mpsc::UnboundedReceiver<GuiCommand>,
+    pub events: EventSink,
+}
+
+fn emit(sink: &Option<EventSink>, event: BotEvent) {
+    if let Some(sink) = sink {
+        sink(event);
+    }
 }
 
 /// An announcement clip mid-stream: precomputed Opus frames, sent one per tick.
@@ -115,9 +151,58 @@ fn make_packet(target: &PlaybackTarget, data: &[u8]) -> OutPacket {
     }
 }
 
+/// Applies a bot command to the running state, returning the reply text.
+/// Shared by the chat-message path and the GUI path.
+fn apply_command<'a>(
+    command: Command,
+    con: &mut Connection,
+    state: &mut TimerState,
+    target: &mut PlaybackTarget,
+    playback: &mut Option<Playback<'a>>,
+    group_id: Option<u64>,
+    scope: WhisperScope,
+) -> Result<String> {
+    let reply = match command {
+        Command::Help => HELP.into(),
+        Command::Channel => {
+            info!("switched to channel playback");
+            *target = PlaybackTarget::CurrentChannel;
+            "switched to channel playback".into()
+        }
+        Command::Group => match group_id {
+            Some(id) => {
+                info!(group = id, "switched to server group whisper");
+                *target = PlaybackTarget::ServerGroup { group_id: id, scope };
+                format!("switched to server group whisper (group {id})")
+            }
+            None => {
+                warn!("no server group configured");
+                "no server group configured (use --whisper-server-group-id at startup)".into()
+            }
+        },
+        Command::Timer(command) => {
+            if matches!(command, TimerCommand::Stop) && playback.take().is_some() {
+                // End the aborted audio stream cleanly.
+                con.send_audio(make_packet(target, &[]))?;
+            }
+
+            let (new_state, reply) = timer::handle_command(command, state);
+            *state = new_state;
+            reply
+        }
+    };
+    Ok(reply)
+}
+
 /// Connects to the TeamSpeak server and runs the bot until the connection
-/// closes or Ctrl-C. `pcm_clips` pairs each announce offset with its clip.
-pub async fn run(args: &Args, pcm_clips: &[(u64, Vec<f32>)]) -> Result<()> {
+/// closes, Ctrl-C, or a GUI disconnect. `pcm_clips` pairs each announce
+/// offset with its clip. `gui` is None when running headless from the CLI.
+pub async fn run(
+    args: &Args,
+    identity: Option<Identity>,
+    pcm_clips: &[(u64, Vec<f32>)],
+    gui: Option<GuiBridge>,
+) -> Result<()> {
     // Encode the clips up front: validates them and makes playback a cheap send-per-tick.
     let mut clips = Vec::with_capacity(pcm_clips.len());
     for (offset, pcm) in pcm_clips {
@@ -147,13 +232,14 @@ pub async fn run(args: &Args, pcm_clips: &[(u64, Vec<f32>)]) -> Result<()> {
     if let Some(password) = &args.channel_password {
         opts = opts.channel_password(password.clone());
     }
-    if let Some(path) = &args.identity_file {
-        let identity_text = std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read identity file {}", path.display()))?;
-        let identity = Identity::new_from_str(identity_text.trim())
-            .map_err(|e| anyhow!("failed to parse identity from --identity-file: {e:?}"))?;
+    if let Some(identity) = identity {
         opts = opts.identity(identity);
     }
+
+    let (mut gui_rx, ui_events) = match gui {
+        Some(bridge) => (Some(bridge.commands), Some(bridge.events)),
+        None => (None, None),
+    };
 
     info!("Connecting to {} as {} ...", args.server, args.name);
     let mut con = opts
@@ -191,6 +277,13 @@ pub async fn run(args: &Args, pcm_clips: &[(u64, Vec<f32>)]) -> Result<()> {
     let mut state = TimerState::Stopped;
     let mut playback: Option<Playback> = None;
 
+    emit(&ui_events, BotEvent::Connected);
+    emit(&ui_events, BotEvent::Timer(state));
+    emit(
+        &ui_events,
+        BotEvent::Whispering(matches!(target, PlaybackTarget::ServerGroup { .. })),
+    );
+
     loop {
         // What fires next: the pending audio frame while a clip is streaming,
         // otherwise the next timer transition.
@@ -210,6 +303,7 @@ pub async fn run(args: &Args, pcm_clips: &[(u64, Vec<f32>)]) -> Result<()> {
                     None => {
                         info!("Jungle timer finished all announcements.");
                         state = TimerState::Stopped;
+                        emit(&ui_events, BotEvent::Timer(state));
                         continue;
                     }
                 },
@@ -246,32 +340,24 @@ pub async fn run(args: &Args, pcm_clips: &[(u64, Vec<f32>)]) -> Result<()> {
                     }
 
                     let reply = match parsed {
-                        Ok(Command::Help) => HELP.into(),
-                        Ok(Command::Channel) => {
-                            info!("switched to channel playback");
-                            target = PlaybackTarget::CurrentChannel;
-                            "switched to channel playback".into()
-                        }
-                        Ok(Command::Group) => match group_id {
-                            Some(id) => {
-                                info!(group = id, "switched to server group whisper");
-                                target = PlaybackTarget::ServerGroup { group_id: id, scope };
-                                format!("switched to server group whisper (group {id})")
-                            }
-                            None => {
-                                warn!("no server group configured");
-                                "no server group configured (use --whisper-server-group-id at startup)"
-                                    .into()
-                            }
-                        },
-                        Ok(Command::Timer(command)) => {
-                            if matches!(command, TimerCommand::Stop) && playback.take().is_some() {
-                                // End the aborted audio stream cleanly.
-                                con.send_audio(make_packet(&target, &[]))?;
-                            }
-
-                            let (new_state, reply) = timer::handle_command(command, &state);
-                            state = new_state;
+                        Ok(command) => {
+                            let reply = apply_command(
+                                command,
+                                &mut con,
+                                &mut state,
+                                &mut target,
+                                &mut playback,
+                                group_id,
+                                scope,
+                            )?;
+                            emit(&ui_events, BotEvent::Timer(state));
+                            emit(
+                                &ui_events,
+                                BotEvent::Whispering(matches!(
+                                    target,
+                                    PlaybackTarget::ServerGroup { .. }
+                                )),
+                            );
                             reply
                         }
                         Err(err) => {
@@ -309,6 +395,7 @@ pub async fn run(args: &Args, pcm_clips: &[(u64, Vec<f32>)]) -> Result<()> {
                     Due::GameStart { game_zero } => {
                         info!("Jungle timer started.");
                         state = TimerState::Running { game_zero };
+                        emit(&ui_events, BotEvent::Timer(state));
                     }
                     Due::Announce { offset, game_zero } => {
                         let (_, frames) = clips
@@ -324,12 +411,42 @@ pub async fn run(args: &Args, pcm_clips: &[(u64, Vec<f32>)]) -> Result<()> {
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Disconnecting ...");
-                con.disconnect(DisconnectOptions::new())?;
-                break;
+            // GUI buttons produce the same commands as chat messages; the
+            // branch is disabled in CLI mode.
+            command = async { gui_rx.as_mut().expect("branch disabled without gui").recv().await }, if gui_rx.is_some() => {
+                match command {
+                    Some(GuiCommand::Command(command)) => {
+                        apply_command(
+                            command,
+                            &mut con,
+                            &mut state,
+                            &mut target,
+                            &mut playback,
+                            group_id,
+                            scope,
+                        )?;
+                        emit(&ui_events, BotEvent::Timer(state));
+                        emit(
+                            &ui_events,
+                            BotEvent::Whispering(matches!(target, PlaybackTarget::ServerGroup { .. })),
+                        );
+                    }
+                    // None: the GUI dropped its sender, treat it as disconnect.
+                    Some(GuiCommand::Disconnect) | None => break,
+                }
             }
+            _ = tokio::signal::ctrl_c() => break,
         }
+    }
+
+    info!("Disconnecting ...");
+    con.disconnect(DisconnectOptions::new())?;
+    // The disconnect packet is only sent (and acked) while the connection
+    // keeps being polled; breaking straight out would leave the server to
+    // time the client out instead.
+    let drain = con.events().for_each(|_| future::ready(()));
+    if time::timeout(Duration::from_secs(3), drain).await.is_err() {
+        warn!("server did not acknowledge the disconnect in time");
     }
 
     Ok(())

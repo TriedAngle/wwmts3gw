@@ -119,7 +119,7 @@ fn start_timer(elapsed: Duration, delay: Duration) -> (TimerState, String) {
     (state, msg)
 }
 
-fn status_message(state: &TimerState) -> String {
+pub fn status_message(state: &TimerState) -> String {
     match state {
         TimerState::Stopped => "timer is stopped".into(),
         TimerState::Countdown { starts_at, .. } => {
@@ -197,13 +197,13 @@ fn parse_set(args: &[&str]) -> Result<TimerCommand, String> {
 }
 
 /// Converts a game clock reading ("25:00 on the clock") into elapsed game time.
-fn parse_gametime(text: &str) -> Result<Duration, String> {
+pub fn parse_gametime(text: &str) -> Result<Duration, String> {
     GAME_LENGTH
         .checked_sub(parse_mmss(text)?)
         .ok_or_else(|| "game time cannot exceed 30:00".into())
 }
 
-fn parse_mmss(text: &str) -> Result<Duration, String> {
+pub fn parse_mmss(text: &str) -> Result<Duration, String> {
     let invalid = || format!("'{text}' is not a valid time; expected MM:SS");
     let (min, sec) = text.split_once(':').ok_or_else(invalid)?;
     let m: u64 = min.parse().map_err(|_| invalid())?;

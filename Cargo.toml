@@ -7,11 +7,19 @@ edition = "2021"
 anyhow = "1"
 audiopus = "0.2"
 clap = { version = "4", features = ["derive"] }
+directories = "6"
+eframe = "0.32"
 futures = "0.3"
+rfd = "0.15"
+serde = { version = "1.0.229", features = ["derive"] }
 symphonia = { version = "0.5", features = ["all"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ts-bookkeeping = "0.1"
 tsclientlib = "0.2.0"
 tsproto-packets = "0.1"
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Console"] }

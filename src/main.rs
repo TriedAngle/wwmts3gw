@@ -1,10 +1,17 @@
+// GUI subsystem on Windows: double-clicking the exe must not open a console
+// window. CLI mode reattaches to the parent console in main() instead.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 mod audio;
+mod config;
+mod gui;
 mod timer;
 mod ts3;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
+use tsclientlib::Identity;
 
 use ts3::WhisperScope;
 
@@ -55,8 +62,26 @@ pub struct Args {
     pub whisper_scope: WhisperScope,
 }
 
+fn main() -> Result<()> {
+    // When started from a terminal on Windows, reattach to its console so
+    // CLI output still shows despite the GUI subsystem above.
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+        AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+
+    // No arguments (a double-clicked executable) opens the GUI; any argument
+    // means the classic headless CLI.
+    if std::env::args_os().len() <= 1 {
+        gui::run()
+    } else {
+        run_cli()
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run_cli() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -74,6 +99,19 @@ async fn main() -> Result<()> {
         bail!("--volume must be >= 0.0");
     }
 
+    let identity = match &args.identity_file {
+        Some(path) => {
+            let identity_text = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read identity file {}", path.display()))?;
+            Some(
+                Identity::new_from_str(identity_text.trim()).map_err(|e| {
+                    anyhow!("failed to parse identity from --identity-file: {e:?}")
+                })?,
+            )
+        }
+        None => None,
+    };
+
     // Decode the clips up front so bad files fail at startup, not mid-game.
     let clip_paths = [&args.warn_60s, &args.warn_30s, &args.warn_15s];
     let mut clips = Vec::with_capacity(clip_paths.len());
@@ -83,5 +121,5 @@ async fn main() -> Result<()> {
         clips.push((offset, pcm));
     }
 
-    ts3::run(&args, &clips).await
+    ts3::run(&args, identity, &clips, None).await
 }

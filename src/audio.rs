@@ -16,6 +16,12 @@ pub const SAMPLE_RATE: usize = 48_000;
 pub fn decode_clip(path: &Path, volume: f32) -> Result<Vec<f32>> {
     let data = std::fs::read(path)
         .with_context(|| format!("failed to read audio file: {}", path.display()))?;
+    decode_clip_bytes(data, volume)
+}
+
+/// Same as [`decode_clip`], but for in-memory audio (e.g. clips embedded
+/// in the executable).
+pub fn decode_clip_bytes(data: Vec<u8>, volume: f32) -> Result<Vec<f32>> {
     let mss = MediaSourceStream::new(Box::new(Cursor::new(data)), Default::default());
 
     let probed = symphonia::default::get_probe()
