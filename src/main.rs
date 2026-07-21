@@ -28,11 +28,14 @@ pub struct Args {
     #[arg(long, default_value = "assets/Jungle 60 sec.wav")]
     pub warn_60s: PathBuf,
 
-    #[arg(long, default_value = "assets/Jungle 30 sec.wav")]
-    pub warn_30s: PathBuf,
+    #[arg(long, default_value = "assets/Jungle 40 sec.wav")]
+    pub warn_40s: PathBuf,
 
-    #[arg(long, default_value = "assets/Jungle 15 sec.wav")]
-    pub warn_15s: PathBuf,
+    #[arg(long, default_value = "assets/Jungle 20 sec.wav")]
+    pub warn_20s: PathBuf,
+
+    #[arg(long, default_value = "assets/Zeal.wav")]
+    pub zeal: PathBuf,
 
     #[arg(long, default_value = "rust-mp3-bot")]
     pub name: String,
@@ -57,6 +60,10 @@ pub struct Args {
 
     #[arg(long = "whisper-server-group-id")]
     pub whisper_server_group_id: Option<u64>,
+
+    /// Whisper zeal announcements to this server group instead of the jungle target.
+    #[arg(long = "zeal-server-group-id")]
+    pub zeal_server_group_id: Option<u64>,
 
     #[arg(long = "whisper-scope", value_enum, default_value = "all-channels")]
     pub whisper_scope: WhisperScope,
@@ -113,13 +120,16 @@ async fn run_cli() -> Result<()> {
     };
 
     // Decode the clips up front so bad files fail at startup, not mid-game.
-    let clip_paths = [&args.warn_60s, &args.warn_30s, &args.warn_15s];
-    let mut clips = Vec::with_capacity(clip_paths.len());
+    let clip_paths = [&args.warn_60s, &args.warn_40s, &args.warn_20s];
+    let mut clips = Vec::with_capacity(clip_paths.len() + 1);
     for (&offset, path) in timer::ANNOUNCE_OFFSETS.iter().zip(clip_paths) {
         let pcm = audio::decode_clip(path, args.volume)
             .with_context(|| format!("failed to load {offset}s announcement {}", path.display()))?;
-        clips.push((offset, pcm));
+        clips.push((timer::Sound::Jungle(offset), pcm));
     }
+    let pcm = audio::decode_clip(&args.zeal, args.volume)
+        .with_context(|| format!("failed to load zeal sound {}", args.zeal.display()))?;
+    clips.push((timer::Sound::Zeal, pcm));
 
     ts3::run(&args, identity, &clips, None).await
 }

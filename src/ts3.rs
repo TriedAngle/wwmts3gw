@@ -17,7 +17,7 @@ use tsclientlib::{
 use tsproto_packets::packets::{AudioData, CodecType, OutAudio, OutPacket};
 
 use crate::audio;
-use crate::timer::{self, Command, TimerCommand, TimerState};
+use crate::timer::{self, Command, Sound, TimerCommand, TimerState};
 use crate::Args;
 
 const SAMPLES_PER_FRAME: usize = audio::SAMPLE_RATE / 50;
@@ -98,6 +98,8 @@ struct Playback<'a> {
     frames: &'a [Vec<u8>],
     idx: usize,
     next_at: Instant,
+    /// Where this clip goes; zeal can whisper to its own server group.
+    target: PlaybackTarget,
 }
 
 /// What the next deadline does when it fires.
@@ -105,7 +107,7 @@ struct Playback<'a> {
 enum Due {
     Frame,
     GameStart { game_zero: Instant },
-    Announce { offset: u64, game_zero: Instant },
+    Announce { play_at: Instant, game_zero: Instant },
 }
 
 /// TeamSpeak clients render ':x' sequences as emoticons ("30:00" becomes "30😲0").
@@ -159,8 +161,8 @@ fn apply_command<'a>(
     state: &mut TimerState,
     target: &mut PlaybackTarget,
     playback: &mut Option<Playback<'a>>,
-    group_id: Option<u64>,
-    scope: WhisperScope,
+    queue: &mut Vec<Sound>,
+    whisper: Option<(u64, WhisperScope)>,
 ) -> Result<String> {
     let reply = match command {
         Command::Help => HELP.into(),
@@ -169,8 +171,8 @@ fn apply_command<'a>(
             *target = PlaybackTarget::CurrentChannel;
             "switched to channel playback".into()
         }
-        Command::Group => match group_id {
-            Some(id) => {
+        Command::Group => match whisper {
+            Some((id, scope)) => {
                 info!(group = id, "switched to server group whisper");
                 *target = PlaybackTarget::ServerGroup { group_id: id, scope };
                 format!("switched to server group whisper (group {id})")
@@ -181,9 +183,12 @@ fn apply_command<'a>(
             }
         },
         Command::Timer(command) => {
-            if matches!(command, TimerCommand::Stop) && playback.take().is_some() {
-                // End the aborted audio stream cleanly.
-                con.send_audio(make_packet(target, &[]))?;
+            if matches!(command, TimerCommand::Stop) {
+                queue.clear();
+                if let Some(p) = playback.take() {
+                    // End the aborted audio stream cleanly.
+                    con.send_audio(make_packet(&p.target, &[]))?;
+                }
             }
 
             let (new_state, reply) = timer::handle_command(command, state);
@@ -195,24 +200,27 @@ fn apply_command<'a>(
 }
 
 /// Connects to the TeamSpeak server and runs the bot until the connection
-/// closes, Ctrl-C, or a GUI disconnect. `pcm_clips` pairs each announce
-/// offset with its clip. `gui` is None when running headless from the CLI.
+/// closes, Ctrl-C, or a GUI disconnect. `pcm_clips` pairs each sound with its
+/// clip. `gui` is None when running headless from the CLI.
 pub async fn run(
     args: &Args,
     identity: Option<Identity>,
-    pcm_clips: &[(u64, Vec<f32>)],
+    pcm_clips: &[(Sound, Vec<f32>)],
     gui: Option<GuiBridge>,
 ) -> Result<()> {
     // Encode the clips up front: validates them and makes playback a cheap send-per-tick.
     let mut clips = Vec::with_capacity(pcm_clips.len());
-    for (offset, pcm) in pcm_clips {
+    for (sound, pcm) in pcm_clips {
         let frames = encode_frames(pcm)
-            .with_context(|| format!("failed to encode {offset}s announcement"))?;
-        clips.push((*offset, frames));
+            .with_context(|| format!("failed to encode {sound:?} clip"))?;
+        clips.push((*sound, frames));
     }
 
     let group_id = args.whisper_server_group_id;
     let scope = args.whisper_scope;
+    let whisper = group_id.map(|id| (id, scope));
+    // Zeal whispers to its own group when configured, else to the jungle target.
+    let zeal_group = args.zeal_server_group_id.map(|id| (id, scope));
     let mut target = match group_id {
         Some(group_id) => PlaybackTarget::ServerGroup { group_id, scope },
         None => PlaybackTarget::CurrentChannel,
@@ -270,12 +278,18 @@ pub async fn run(
             info!("Normal mode: playing into the bot's current channel");
         }
     }
+    if let Some((group_id, scope)) = zeal_group {
+        info!("Zeal mode: whispers to server group {group_id}, scope={scope:?}");
+    }
 
     info!("Jungle timer is stopped. Send '!jungle start' in TeamSpeak chat to begin.");
     info!("Commands: '!jungle start [MM:SS] [at MM:SS]', '!jungle set MM:SS', '!jungle stop'.");
 
     let mut state = TimerState::Stopped;
     let mut playback: Option<Playback> = None;
+    // Sounds whose turn came while a clip was streaming; played back to back,
+    // jungle warnings before zeal.
+    let mut queue: Vec<Sound> = Vec::new();
 
     emit(&ui_events, BotEvent::Connected);
     emit(&ui_events, BotEvent::Timer(state));
@@ -285,30 +299,57 @@ pub async fn run(
     );
 
     loop {
+        // The line is free: start the next queued sound, if any.
+        if playback.is_none() && !queue.is_empty() {
+            let jungle = queue
+                .iter()
+                .position(|s| matches!(s, Sound::Jungle(_)))
+                .unwrap_or(0);
+            let sound = queue.remove(jungle);
+            let (_, frames) = clips
+                .iter()
+                .find(|(s, _)| *s == sound)
+                .expect("a clip is loaded for every sound");
+            info!(?sound, "playing sound");
+            let play_target = match (sound, zeal_group) {
+                (Sound::Zeal, Some((group_id, scope))) => {
+                    PlaybackTarget::ServerGroup { group_id, scope }
+                }
+                _ => target.clone(),
+            };
+            playback = Some(Playback {
+                frames,
+                idx: 0,
+                next_at: Instant::now(),
+                target: play_target,
+            });
+        }
+
         // What fires next: the pending audio frame while a clip is streaming,
-        // otherwise the next timer transition.
-        let pending = if let Some(p) = &playback {
-            Some((p.next_at, Due::Frame))
-        } else {
-            match state {
-                TimerState::Stopped => None,
-                TimerState::Countdown { starts_at, elapsed } => Some((
-                    starts_at,
-                    Due::GameStart {
-                        game_zero: starts_at.checked_sub(elapsed).unwrap_or(starts_at),
-                    },
-                )),
-                TimerState::Running { game_zero } => match timer::next_announcement(game_zero) {
-                    Some((play_at, offset)) => Some((play_at, Due::Announce { offset, game_zero })),
-                    None => {
-                        info!("Jungle timer finished all announcements.");
-                        state = TimerState::Stopped;
-                        emit(&ui_events, BotEvent::Timer(state));
-                        continue;
-                    }
+        // or the next timer transition — whichever comes first.
+        let frame = playback.as_ref().map(|p| (p.next_at, Due::Frame));
+        let transition = match state {
+            TimerState::Stopped => None,
+            TimerState::Countdown { starts_at, elapsed } => Some((
+                starts_at,
+                Due::GameStart {
+                    game_zero: starts_at.checked_sub(elapsed).unwrap_or(starts_at),
                 },
-            }
+            )),
+            TimerState::Running { game_zero } => match timer::next_announcement(game_zero) {
+                Some((play_at, _)) => Some((play_at, Due::Announce { play_at, game_zero })),
+                None => {
+                    info!("Jungle timer finished all announcements.");
+                    state = TimerState::Stopped;
+                    emit(&ui_events, BotEvent::Timer(state));
+                    continue;
+                }
+            },
         };
+        let pending = [frame, transition]
+            .into_iter()
+            .flatten()
+            .min_by_key(|(at, _)| *at);
 
         tokio::select! {
             // into_future() consumes the stream so the future owns the &mut con borrow;
@@ -347,8 +388,8 @@ pub async fn run(
                                 &mut state,
                                 &mut target,
                                 &mut playback,
-                                group_id,
-                                scope,
+                                &mut queue,
+                                whisper,
                             )?;
                             emit(&ui_events, BotEvent::Timer(state));
                             emit(
@@ -381,13 +422,14 @@ pub async fn run(
                         let p = playback.as_mut().expect("Due::Frame implies active playback");
                         match p.frames.get(p.idx) {
                             Some(frame) => {
-                                con.send_audio(make_packet(&target, frame))
+                                con.send_audio(make_packet(&p.target, frame))
                                     .context("failed to send TeamSpeak audio packet")?;
                                 p.idx += 1;
                                 p.next_at += FRAME_DURATION;
                             }
                             None => {
-                                con.send_audio(make_packet(&target, &[]))?;
+                                let packet = make_packet(&p.target, &[]);
+                                con.send_audio(packet)?;
                                 playback = None;
                             }
                         }
@@ -397,17 +439,12 @@ pub async fn run(
                         state = TimerState::Running { game_zero };
                         emit(&ui_events, BotEvent::Timer(state));
                     }
-                    Due::Announce { offset, game_zero } => {
-                        let (_, frames) = clips
-                            .iter()
-                            .find(|(o, _)| *o == offset)
-                            .expect("a clip is loaded for every announce offset");
-                        info!(
-                            offset,
-                            remaining = timer::format_remaining(Instant::now().duration_since(game_zero)),
-                            "playing announcement",
-                        );
-                        playback = Some(Playback { frames, idx: 0, next_at: Instant::now() });
+                    Due::Announce { play_at, game_zero } => {
+                        // Everything due this second goes on the queue (jungle
+                        // first); the pump at the top of the loop starts it
+                        // now or after the current clip ends.
+                        let at = play_at.duration_since(game_zero).as_secs();
+                        queue.extend(timer::due_sounds(at));
                     }
                 }
             }
@@ -422,8 +459,8 @@ pub async fn run(
                             &mut state,
                             &mut target,
                             &mut playback,
-                            group_id,
-                            scope,
+                            &mut queue,
+                            whisper,
                         )?;
                         emit(&ui_events, BotEvent::Timer(state));
                         emit(

@@ -5,9 +5,22 @@ use tracing::{info, warn};
 
 pub const GAME_LENGTH: Duration = Duration::from_secs(30 * 60);
 const JUNGLE_INTERVAL: Duration = Duration::from_secs(5 * 60);
-pub const ANNOUNCE_OFFSETS: &[u64] = &[60, 30, 15];
+pub const ANNOUNCE_OFFSETS: &[u64] = &[60, 40, 20];
+/// Zeal spawns 15 s after game start (29:45 on the clock), then every
+/// 3:05 — the last one lands at 08:10, the next (05:05) is suppressed.
+const ZEAL_FIRST: Duration = Duration::from_secs(15);
+const ZEAL_INTERVAL: Duration = Duration::from_secs(3 * 60 + 5);
+const ZEAL_LAST: Duration = Duration::from_secs(22 * 60); // elapsed time at clock 08:00
 /// Upper bound on user-supplied MM:SS values; keeps `Instant + delay` from overflowing.
 const MAX_MINUTES: u64 = 24 * 60;
+
+/// A scheduled sound: a jungle warning `offset` seconds before a camp spawn,
+/// or the zeal spawn itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sound {
+    Jungle(u64),
+    Zeal,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum TimerState {
@@ -35,19 +48,47 @@ pub enum TimerCommand {
     Status,
 }
 
-pub fn next_announcement(game_zero: Instant) -> Option<(Instant, u64)> {
-    let e = Instant::now().duration_since(game_zero).as_secs();
-    let mut spawn = (e / JUNGLE_INTERVAL.as_secs() + 1) * JUNGLE_INTERVAL.as_secs();
-    while spawn < GAME_LENGTH.as_secs() {
-        for &offset in ANNOUNCE_OFFSETS {
-            let at = spawn.saturating_sub(offset);
-            if at > e {
-                return Some((game_zero + Duration::from_secs(at), offset));
-            }
+/// All sounds scheduled exactly `at` seconds after game start, jungle
+/// warnings first. Single source of truth for the schedule; almost always
+/// one entry, but several when timings are changed to overlap — the bot
+/// queues those and plays them back to back.
+pub fn due_sounds(at: u64) -> Vec<Sound> {
+    let mut sounds = Vec::new();
+    let interval = JUNGLE_INTERVAL.as_secs();
+    for &offset in ANNOUNCE_OFFSETS {
+        let spawn = at + offset;
+        if spawn >= interval && spawn < GAME_LENGTH.as_secs() && spawn.is_multiple_of(interval) {
+            sounds.push(Sound::Jungle(offset));
         }
-        spawn += JUNGLE_INTERVAL.as_secs();
     }
-    None
+    if (ZEAL_FIRST.as_secs()..=ZEAL_LAST.as_secs()).contains(&at)
+        && (at - ZEAL_FIRST.as_secs()).is_multiple_of(ZEAL_INTERVAL.as_secs())
+    {
+        sounds.push(Sound::Zeal);
+    }
+    sounds
+}
+
+/// The next sound to play, whichever comes first. Overlapping events on the
+/// same second are reported one per call (jungle first); the caller drains
+/// the rest via [`due_sounds`].
+pub fn next_announcement(game_zero: Instant) -> Option<(Instant, Sound)> {
+    let e = Instant::now().duration_since(game_zero).as_secs();
+    next_after(e).map(|(at, sound)| (game_zero + Duration::from_secs(at), sound))
+}
+
+/// The first scheduled sound strictly after `e` seconds of game time.
+fn next_after(e: u64) -> Option<(u64, Sound)> {
+    (e + 1..GAME_LENGTH.as_secs()).find_map(|at| due_sounds(at).first().map(|s| (at, *s)))
+}
+
+/// "...; next announcement at 24:00 (60s warning)" / "...; next zeal at 29:45".
+fn next_message(prefix: &str, play_at: Instant, game_zero: Instant, sound: Sound) -> String {
+    let at = format_remaining(play_at.duration_since(game_zero));
+    match sound {
+        Sound::Jungle(offset) => format!("{prefix}; next announcement at {at} ({offset}s warning)"),
+        Sound::Zeal => format!("{prefix}; next zeal at {at}"),
+    }
 }
 
 /// Applies a timer command, returning the new state and the reply for the sender.
@@ -106,12 +147,13 @@ fn start_timer(elapsed: Duration, delay: Duration) -> (TimerState, String) {
                 format_remaining(elapsed),
             ),
         ),
-        Some((play_at, offset)) => (
+        Some((play_at, sound)) => (
             TimerState::Running { game_zero },
-            format!(
-                "started at {}; next announcement at {} ({offset}s warning)",
-                format_remaining(elapsed),
-                format_remaining(play_at.duration_since(game_zero)),
+            next_message(
+                &format!("started at {}", format_remaining(elapsed)),
+                play_at,
+                game_zero,
+                sound,
             ),
         ),
     };
@@ -131,13 +173,12 @@ pub fn status_message(state: &TimerState) -> String {
         TimerState::Running { game_zero } => {
             let elapsed = Instant::now().duration_since(*game_zero);
             match next_announcement(*game_zero) {
-                Some((play_at, offset)) => {
-                    format!(
-                        "running at {}; next announcement at {} ({offset}s warning)",
-                        format_remaining(elapsed),
-                        format_remaining(play_at.duration_since(*game_zero)),
-                    )
-                }
+                Some((play_at, sound)) => next_message(
+                    &format!("running at {}", format_remaining(elapsed)),
+                    play_at,
+                    *game_zero,
+                    sound,
+                ),
                 None => format!(
                     "running at {}: no remaining announcements",
                     format_remaining(elapsed),
@@ -253,6 +294,45 @@ mod tests {
                 }
                 other => panic!("{msg} parsed as {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn schedules_zeal_spawns() {
+        let zeals: Vec<u64> = (0..GAME_LENGTH.as_secs())
+            .filter(|&at| due_sounds(at).contains(&Sound::Zeal))
+            .collect();
+        // Every 3:05 from 0:15 elapsed (29:45 on the clock): 29:45, 26:40,
+        // 23:35, 20:30, 17:25, 14:20, 11:15, 08:10 — 05:05 is suppressed.
+        assert_eq!(zeals, vec![15, 200, 385, 570, 755, 940, 1125, 1310]);
+    }
+
+    #[test]
+    fn schedules_jungle_warnings() {
+        for (offset, first) in [(60, 240), (40, 260), (20, 280)] {
+            let warnings: Vec<u64> = (0..GAME_LENGTH.as_secs())
+                .filter(|&at| due_sounds(at).contains(&Sound::Jungle(offset)))
+                .collect();
+            // Each offset fires 5 times, once per spawn mark; none before
+            // the 30:00 start or after the 0:00 end.
+            assert_eq!(
+                warnings,
+                (0..5).map(|i| first + i * 300).collect::<Vec<_>>(),
+                "{offset}s warning"
+            );
+        }
+    }
+
+    #[test]
+    fn zeal_and_jungle_currently_never_collide() {
+        // Overlaps are handled (queued, jungle first), so a failure here is
+        // not a bug — it just means the timings changed and playback order
+        // for the overlap should be double-checked.
+        for at in 0..GAME_LENGTH.as_secs() {
+            let sounds = due_sounds(at);
+            let jungle = sounds.iter().any(|s| matches!(s, Sound::Jungle(_)));
+            let zeal = sounds.contains(&Sound::Zeal);
+            assert!(!(jungle && zeal), "collision at {at}");
         }
     }
 

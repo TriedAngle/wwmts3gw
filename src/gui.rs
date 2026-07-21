@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use tsclientlib::Identity;
 
 use crate::config::Config;
-use crate::timer::{self, Command, TimerCommand, TimerState};
+use crate::timer::{self, Command, Sound, TimerCommand, TimerState};
 use crate::ts3::{self, BotEvent, GuiBridge, GuiCommand, WhisperScope};
 use crate::{audio, Args};
 
@@ -172,6 +172,16 @@ impl App {
         } else {
             None
         };
+        let zeal_server_group_id = if cfg.whisper_enabled && !cfg.zeal_group_id.trim().is_empty() {
+            Some(
+                cfg.zeal_group_id
+                    .trim()
+                    .parse::<u64>()
+                    .context("zeal group id must be a number")?,
+            )
+        } else {
+            None
+        };
 
         if cfg.identity.is_none() {
             info!("generating a new TeamSpeak identity (kept in the config file)");
@@ -190,8 +200,9 @@ impl App {
             // Unused in GUI mode: clips are decoded above, from the embedded
             // data or the configured overrides.
             warn_60s: Default::default(),
-            warn_30s: Default::default(),
-            warn_15s: Default::default(),
+            warn_40s: Default::default(),
+            warn_20s: Default::default(),
+            zeal: Default::default(),
             name,
             channel,
             channel_id,
@@ -202,6 +213,7 @@ impl App {
             identity_file: None,
             volume: cfg.volume,
             whisper_server_group_id,
+            zeal_server_group_id,
             whisper_scope: cfg.whisper_scope,
         };
 
@@ -314,6 +326,14 @@ impl App {
                         );
                         ui.end_row();
 
+                        ui.label("Zeal group ID");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.config.zeal_group_id)
+                                .desired_width(100.0)
+                                .hint_text("empty = same group"),
+                        );
+                        ui.end_row();
+
                         ui.label("Scope");
                         ui.horizontal(|ui| {
                             ui.radio_value(
@@ -341,8 +361,9 @@ impl App {
                 .show(ui, |ui| {
                     for (label, path) in [
                         ("60 s warning", &mut self.config.clip_60),
-                        ("30 s warning", &mut self.config.clip_30),
-                        ("15 s warning", &mut self.config.clip_15),
+                        ("40 s warning", &mut self.config.clip_40),
+                        ("20 s warning", &mut self.config.clip_20),
+                        ("Zeal", &mut self.config.zeal_clip),
                     ] {
                         ui.label(label);
                         if ui.button("Browse…").clicked() {
@@ -491,22 +512,23 @@ fn parse_start(at: &str, delay: &str) -> Result<Command, String> {
     Ok(Command::Timer(TimerCommand::Start { elapsed, delay }))
 }
 
-/// Decodes the three configured announcement clips.
-fn load_clips(cfg: &Config) -> Result<Vec<(u64, Vec<f32>)>> {
+/// Decodes the four configured announcement clips.
+fn load_clips(cfg: &Config) -> Result<Vec<(Sound, Vec<f32>)>> {
     let sources = [
-        (60u64, &cfg.clip_60),
-        (30, &cfg.clip_30),
-        (15, &cfg.clip_15),
+        (Sound::Jungle(60), &cfg.clip_60),
+        (Sound::Jungle(40), &cfg.clip_40),
+        (Sound::Jungle(20), &cfg.clip_20),
+        (Sound::Zeal, &cfg.zeal_clip),
     ];
     let mut clips = Vec::with_capacity(sources.len());
-    for (offset, path) in sources {
+    for (sound, path) in sources {
         let path = path.trim();
         if path.is_empty() {
-            bail!("no sound file set for the {offset} s warning");
+            bail!("no sound file set for {sound:?}");
         }
         let pcm = audio::decode_clip(Path::new(path), cfg.volume)
-            .with_context(|| format!("failed to load the {offset}s clip from {path}"))?;
-        clips.push((offset, pcm));
+            .with_context(|| format!("failed to load the {sound:?} clip from {path}"))?;
+        clips.push((sound, pcm));
     }
     Ok(clips)
 }

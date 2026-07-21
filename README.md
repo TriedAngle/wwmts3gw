@@ -1,6 +1,6 @@
 # wwmts3gw
 
-TeamSpeak 3 jungle timer bot for Where Winds Meet guild wars. Plays audio announcements 60, 30, and 15 seconds before each jungle camp spawn. The game timer counts down from 30:00 with spawns every 5 minutes.
+TeamSpeak 3 jungle timer bot for Where Winds Meet guild wars. Plays audio announcements 60, 40, and 20 seconds before each jungle camp spawn. The game timer counts down from 30:00 with spawns every 5 minutes.
 
 ## Dependencies
 
@@ -22,20 +22,22 @@ cargo build --release
 
 ## Audio files
 
-Place the three announcements in the `assets/` directory (or anywhere, use the flags below):
+Place the announcements in the `assets/` directory (or anywhere, use the flags below):
 
 | File | When it plays |
 |---|---|
 | `assets/Jungle 60 sec.wav` | 60 seconds before spawn |
-| `assets/Jungle 30 sec.wav` | 30 seconds before spawn |
-| `assets/Jungle 15 sec.wav` | 15 seconds before spawn |
+| `assets/Jungle 40 sec.wav` | 40 seconds before spawn |
+| `assets/Jungle 20 sec.wav` | 20 seconds before spawn |
+| `assets/Zeal.wav` | at each zeal spawn |
 
 Any common audio format works (WAV, MP3, FLAC, OGG, ...) at any sample rate; clips are downmixed to mono and resampled to 48 kHz at startup. Use the `--warn-*` flags to override paths:
 
 ```bash
 --warn-60s /path/to/60s.wav
---warn-30s /path/to/30s.wav
---warn-15s /path/to/15s.wav
+--warn-40s /path/to/40s.wav
+--warn-20s /path/to/20s.wav
+--zeal /path/to/Zeal.wav
 ```
 
 ## Run
@@ -90,7 +92,25 @@ The game timer counts down from **30:00** to **0:00**. Jungle camps spawn every 
 30:00  25:00  20:00  15:00  10:00  5:00
 ```
 
-Announcements play 60s, 30s, and 15s before each spawn mark. No announcement plays at the **30:00** start (there's nothing before it) or at **0:00** (game over).
+Announcements play 60s, 40s, and 20s before each spawn mark. No announcement plays at the **30:00** start (there's nothing before it) or at **0:00** (game over).
+
+## Zeal schedule
+
+Zeal spawns 15 seconds after game start (**29:45** on the clock) and then every 3:05, down to **08:10**:
+
+```
+29:45  26:40  23:35  20:30  17:25  14:20  11:15  8:10
+```
+
+`Zeal.wav` plays right at each mark (no advance warnings). If a zeal ever coincides with a jungle warning (the current timings don't overlap), the warning plays first and the zeal sound right after.
+
+By default zeal announcements go to the same target as the jungle warnings. To whisper zeal to a different server group, use:
+
+```bash
+--zeal-server-group-id 13
+```
+
+(In the GUI, fill in the "Zeal group ID" field in the Whisper section; empty means same group as jungle.)
 
 ## Permissions
 
